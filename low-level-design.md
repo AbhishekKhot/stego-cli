@@ -9,7 +9,7 @@
 
 ```
 com.stegocli
-├── StegApplication            // main(), Picocli root command
+├── StegoApplication            // main(), Picocli root command
 ├── cli
 │   ├── EncodeCommand          // `steg encode`
 │   └── DecodeCommand          // `steg decode`
@@ -18,6 +18,8 @@ com.stegocli
 ├── crypto
 │   ├── CryptoService          // PBKDF2 + AES-256-GCM
 │   └── EncryptedPayload       // value object: salt + iv + ciphertext
+├── payload
+│   └── PayloadCodec           // header (magic/version/algo/len) + body byte framing
 ├── image
 │   ├── ImageProcessor         // sequential LSB driver, load/write
 │   ├── EncodingStrategy       // interface
@@ -37,14 +39,14 @@ com.stegocli
 
 ## 2. CLI Layer (Picocli)
 
-### `StegApplication`
+### `StegoApplication`
 
 ```java
 @Command(name = "steg", mixinStandardHelpOptions = true, version = "StegoCLI 1.0",
          subcommands = { EncodeCommand.class, DecodeCommand.class })
-public final class StegApplication implements Runnable {
+public final class StegoApplication implements Runnable {
     public static void main(String[] args) {
-        int exitCode = new CommandLine(new StegApplication())
+        int exitCode = new CommandLine(new StegoApplication())
                 .setExecutionExceptionHandler(new StegExceptionHandler())
                 .execute(args);
         System.exit(exitCode);
@@ -102,14 +104,14 @@ public final class SteganographyService {
         long start = System.nanoTime();
         EncodingStrategy strategy = registry.resolve(req.algorithm());
         EncryptedPayload payload  = crypto.encrypt(req.message(), req.password());
-        byte[] framed             = PayloadCodec.frame(payload);     // §6
-        ImageProcessor processor  = new ImageProcessor(strategy);
-        processor.assertCapacity(req.input(), framed.length);
-        processor.embed(req.input(), req.output(), framed);
-        return new EncodeResult(req.output(), framed.length, durationMs(start));
+        ImageProcessor processor  = new ImageProcessor();
+        // The processor decodes the cover once, capacity-checks, then embeds the
+        // 1-bit header (built from strategy.id + body length) followed by the body.
+        long bytesEmbedded = processor.embed(req.input(), req.output(), payload, strategy);
+        return new EncodeResult(req.output(), bytesEmbedded, durationMs(start));
     }
 
-    public DecodeResult decode(DecodeRequest req) { /* symmetric */ }
+    public DecodeResult decode(DecodeRequest req) { /* symmetric: processor.extract → decrypt */ }
 }
 ```
 
@@ -187,28 +189,44 @@ public record EncryptedPayload(byte[] salt, byte[] iv, byte[] ciphertext) {}
 
 ```java
 public interface EncodingStrategy {
-    String name();                                   // "lsb1" / "lsb2"
-    int    bitsPerChannel();                         // 1 or 2
-    long   capacityBytes(int width, int height);     // (w*h*3*bitsPerChannel)/8
-    void   embed(int[] pixels, byte[] payload);      // in-place LSB write
-    byte[] extract(int[] pixels);                    // reads length header, returns framed payload
+    int  id();                                       // 1 (lsb1) / 2 (lsb2) — stored in the header
+    int  bitsPerChannel();                           // 1 or 2
+    long capacityBytes(long channels);               // channels * bitsPerChannel / 8
+
+    /** Write all bits of {@code data} into channel LSBs starting at channel {@code startChannel}. */
+    void   embed(int[] pixels, byte[] data, int startChannel);
+
+    /** Read {@code byteCount} bytes from channel LSBs starting at channel {@code startChannel}. */
+    byte[] extract(int[] pixels, int byteCount, int startChannel);
 }
 ```
 
-Each strategy owns its own capacity math, so adding a new algorithm never touches the service.
+A "channel" is one R/G/B slot; channels are visited R, G, B per pixel, pixels in row-major order. The
+strategy is pure bit-twiddling — it knows nothing about the payload format. Framing lives entirely in
+`PayloadCodec` (§6); the strategy just reads/writes a run of bits at a given offset. The
+`startChannel` parameter is what lets the always-LSB-1 header and the algorithm-specific body coexist
+in one image (see `ImageProcessor` below). Each strategy owns its capacity math, so adding a new
+algorithm never touches the service.
 
 ### `StrategyRegistry`
 
 ```java
 public final class StrategyRegistry {
-    private final Map<String, EncodingStrategy> byName = Map.of(
+    private final Map<String, EncodingStrategy> byFlag = Map.of(
         "lsb1", new Lsb1BitStrategy(),
         "lsb2", new Lsb2BitStrategy());
 
+    /** Resolve the CLI --algorithm flag (encode path). */
     public EncodingStrategy resolve(String flag) {
-        EncodingStrategy s = byName.get(flag.toLowerCase());
+        EncodingStrategy s = byFlag.get(flag.toLowerCase());
         if (s == null) throw new InvalidInputException("Unknown algorithm: " + flag);
         return s;
+    }
+
+    /** Resolve the algorithm id stored in a decoded header (decode path). */
+    public EncodingStrategy byId(int id) {
+        return byFlag.values().stream().filter(s -> s.id() == id).findFirst()
+            .orElseThrow(() -> new BadPasswordException("Unknown algorithm id in payload: " + id));
     }
 }
 ```
@@ -240,30 +258,54 @@ are a single deterministic pass over the pixel array in row-major order.
 
 ### `ImageProcessor`
 
+`ImageProcessor` is stateless — the strategy is passed per call. It decodes the cover once, embeds
+the fixed 8-byte header at **1 bit/channel** (so decode can always read it), then embeds the body at
+the chosen strategy's bit depth in the channels after the header.
+
 ```java
 public final class ImageProcessor {
-    private final EncodingStrategy strategy;
 
-    public ImageProcessor(EncodingStrategy strategy) {
-        this.strategy = strategy;
+    private static final EncodingStrategy HEADER_STRATEGY = new Lsb1BitStrategy();
+    private static final int HEADER_CHANNELS = PayloadCodec.HEADER_BYTES * 8;   // 64 channels @ 1 bpc
+
+    /** @return number of body bytes embedded. */
+    public long embed(Path in, Path out, EncryptedPayload payload, EncodingStrategy strategy) {
+        BufferedImage img = readImage(in);              // any format → raster (UnsupportedFormat/ImageRead)
+        int w = img.getWidth(), h = img.getHeight();
+        int[] pixels = img.getRGB(0, 0, w, h, null, 0, w);
+        long totalChannels = (long) w * h * 3;
+
+        byte[] body   = PayloadCodec.encodeBody(payload);
+        byte[] header = PayloadCodec.encodeHeader(strategy.id(), body.length);
+
+        long bodyCapacity = strategy.capacityBytes(totalChannels - HEADER_CHANNELS);
+        if (body.length > bodyCapacity)
+            throw new CapacityExceededException(body.length, bodyCapacity);
+
+        HEADER_STRATEGY.embed(pixels, header, 0);                 // 8 bytes @ 1 bpc, channels [0,64)
+        strategy.embed(pixels, body, HEADER_CHANNELS);            // body @ strategy bpc, from channel 64
+
+        img.setRGB(0, 0, w, h, pixels, 0, w);
+        writePng(img, out);                                       // always lossless PNG
+        return body.length;
     }
 
-    public void assertCapacity(Path image, int payloadBytes) {
-        Dimension d = readDimensions(image);            // header read, no full decode
-        long cap = strategy.capacityBytes(d.width, d.height);
-        if (payloadBytes > cap)
-            throw new CapacityExceededException(payloadBytes, cap);
-    }
+    public EncryptedPayload extract(Path in, StrategyRegistry registry) {
+        BufferedImage img = readImage(in);
+        int w = img.getWidth(), h = img.getHeight();
+        int[] pixels = img.getRGB(0, 0, w, h, null, 0, w);
 
-    public void embed(Path in, Path out, byte[] payload) {
-        BufferedImage img = readImage(in);              // ImageIO decode → raster
-        int[] pixels = img.getRGB(0, 0, img.getWidth(), img.getHeight(), null, 0, img.getWidth());
-        strategy.embed(pixels, payload);                // single sequential pass
-        img.setRGB(0, 0, img.getWidth(), img.getHeight(), pixels, 0, img.getWidth());
-        writePng(img, out);                             // lossless
-    }
+        byte[] headerBytes = HEADER_STRATEGY.extract(pixels, PayloadCodec.HEADER_BYTES, 0);
+        PayloadCodec.Header header = PayloadCodec.decodeHeader(headerBytes);   // validates magic/version
 
-    public byte[] extract(Path in) { /* symmetric, returns framed payload bytes */ }
+        EncodingStrategy strategy = registry.byId(header.algorithmId());
+        long bodyCapacity = strategy.capacityBytes((long) w * h * 3 - HEADER_CHANNELS);
+        if (header.bodyLength() > bodyCapacity)
+            throw new BadPasswordException("Corrupt payload (declared length exceeds image capacity).");
+
+        byte[] body = strategy.extract(pixels, header.bodyLength(), HEADER_CHANNELS);
+        return PayloadCodec.decodeBody(body);
+    }
 }
 ```
 
@@ -328,29 +370,47 @@ extension is forced to `.png` even if the input was `photo.jpg`.
 
 ## 6. Payload Framing — `PayloadCodec`
 
+The embedded bytes are split into a fixed **header** and a variable **body**, written into the image
+at different bit depths (see §5 / the embedding plan):
+
+```
+HEADER (8 bytes, always embedded at 1 bit/channel)
+  [0..1]  magic  = 'S','G'        identifies a StegoCLI payload
+  [2]     version                  payload format version (currently 1)
+  [3]     algorithmId              1 = LSB-1, 2 = LSB-2  (how the BODY was embedded)
+  [4..7]  bodyLength               big-endian int: number of body bytes that follow
+
+BODY (bodyLength bytes, embedded at the algorithm's bit depth)
+  [0..15]   salt                   16 bytes
+  [16..27]  iv                     12 bytes
+  [28..]    ciphertext + GCM tag   remainder
+```
+
+`PayloadCodec` is pure (no I/O, no image awareness) and exposes four static methods:
+
 ```java
 public final class PayloadCodec {
-    // frame: [4-byte length][salt][iv][ciphertext]
-    public static byte[] frame(EncryptedPayload p) {
-        int bodyLen = p.salt().length + p.iv().length + p.ciphertext().length;
-        ByteBuffer buf = ByteBuffer.allocate(4 + bodyLen);
-        buf.putInt(bodyLen);                 // big-endian by default
-        buf.put(p.salt()).put(p.iv()).put(p.ciphertext());
-        return buf.array();
-    }
+    public static final byte VERSION      = 1;
+    public static final int  HEADER_BYTES = 8;       // magic(2)+version(1)+algo(1)+len(4)
 
-    public static EncryptedPayload unframe(byte[] body) {
-        ByteBuffer buf = ByteBuffer.wrap(body);
-        byte[] salt = new byte[16]; buf.get(salt);
-        byte[] iv   = new byte[12]; buf.get(iv);
-        byte[] ct   = new byte[buf.remaining()]; buf.get(ct);
-        return new EncryptedPayload(salt, iv, ct);
-    }
+    public static byte[]  encodeHeader(int algorithmId, int bodyLength); // -> 8 bytes
+    public static Header   decodeHeader(byte[] header);                  // validates magic+version
+    public static byte[]  encodeBody(EncryptedPayload p);                // salt|iv|ciphertext
+    public static EncryptedPayload decodeBody(byte[] body);              // split back out
+
+    public record Header(int version, int algorithmId, int bodyLength) {}
 }
 ```
 
-On decode the processor first extracts the 32 length bits, reads the `int`, then extracts exactly
-that many bytes — so it never over-reads the image.
+Why a header (rather than the earlier bare `[length][salt][iv][ct]`):
+- **Magic bytes** let `decode` recognise an image that was never encoded and fail cleanly
+  (`BadPasswordException`, "no StegoCLI message found") instead of misreading random LSBs.
+- **Version** byte allows the format to evolve without silently misparsing old images.
+- **algorithmId** makes the payload self-describing: `decode` reads it from the always-LSB-1 header
+  and then knows the bit depth to read the body — so `decode` needs no `--algorithm` flag.
+
+On decode the processor reads the 8-byte header first, validates the magic, then reads exactly
+`bodyLength` body bytes at the indicated bit depth — so it never over-reads the image.
 
 ---
 
@@ -391,10 +451,10 @@ free of `throws` clutter; the handler is the single place that maps them to user
 | Layer | What is tested | How |
 |---|---|---|
 | `CryptoService` | round-trip encrypt→decrypt; wrong password → `BadPasswordException`; salt/IV randomness | pure unit, no mocks |
-| `PayloadCodec` | frame→unframe round-trip; length boundary | pure unit |
+| `PayloadCodec` | header encode/decode (magic, version, algo, length); body split round-trip; missing magic → `BadPasswordException` | pure unit |
 | Strategies | embed→extract round-trip on a synthetic `int[]`; capacity math; LSB-1 vs LSB-2 | pure unit |
 | `ImageProcessor` | capacity rejection; any-format input (PNG/JPEG/BMP); PNG output decodes identically | unit + temp files |
-| `SteganographyService` | orchestration order (encrypt → frame → capacity → embed) | Mockito mocks for crypto + processor |
+| `SteganographyService` | orchestration order (resolve strategy → encrypt → embed) | Mockito mocks for crypto + processor |
 | End-to-end | `encode` then `decode` via the CLI yields the original message (incl. a JPEG cover) | full-stack test on a fixture image |
 
 Key invariant under test: **for any message M ≤ capacity and password P,

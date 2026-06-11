@@ -211,10 +211,11 @@ stegocli/
 └── src/
     ├── main/
     │   ├── java/com/stegocli/
-    │   │   ├── StegApplication.java          # Picocli root + main
+    │   │   ├── StegoApplication.java          # Picocli root + main
     │   │   ├── cli/                          # EncodeCommand, DecodeCommand
     │   │   ├── service/                      # SteganographyService
     │   │   ├── crypto/                        # CryptoService, EncryptedPayload
+    │   │   ├── payload/                       # PayloadCodec (header + body byte framing)
     │   │   ├── image/                         # ImageProcessor, strategies
     │   │   └── exception/                     # StegoException hierarchy
     │   └── resources/
