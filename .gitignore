@@ -1,0 +1,27 @@
+# ---- Maven / build output ----
+target/
+*.class
+dependency-reduced-pom.xml
+.mvn/
+mvnw
+mvnw.cmd
+
+# ---- IDEs / editors ----
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.project
+.classpath
+.factorypath
+*.swp
+
+# ---- OS cruft ----
+.DS_Store
+Thumbs.db
+
+# ---- Logs / temp ----
+*.log
+*.tmp
