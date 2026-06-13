@@ -72,7 +72,7 @@ public abstract class AbstractLsbStrategy implements EncodingStrategy {
         final int channelNeeded = (totalBits + bpc - 1) / bpc;
 
         if (byteCount < 0 || startChannel < 0 || startChannel + channelNeeded > totalChannels) {
-            throw new StegoExcpetion(
+            throw new StegoException(
                     "Not enough image channels to extract " + byteCount + " bytes at channel offset " + startChannel);
         }
 

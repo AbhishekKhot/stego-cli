@@ -1,10 +1,13 @@
+// src/main/java/com/stegocli/image/StrategyRegistry.java
 package com.stegocli.image;
 
+import com.stegocli.exception.BadPasswordException;
+import com.stegocli.exception.InvalidInputException;
+
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
-
-import javax.sound.sampled.AudioFormat.Encoding;
 
 /**
  * Central lookup for the available {@link EncodingStrategy} implementations.
@@ -21,14 +24,15 @@ import javax.sound.sampled.AudioFormat.Encoding;
  *
  * Adding a new algorithm means registering it here once; nothing else changes.
  */
-public class StrategyRegistery {
+public final class StrategyRegistry {
+
     private final Map<String, EncodingStrategy> byFlag;
 
-    public StrategyRegistery() {
+    public StrategyRegistry() {
         Map<String, EncodingStrategy> map = new LinkedHashMap<>();
-        map.put("lab1", new Lsb1BitStrategy());
-        map.put("lbs2", new Lsb2BitStrategy());
-        this.byFlag = map;
+        map.put("lsb1", new Lsb1BitStrategy());
+        map.put("lsb2", new Lsb2BitStrategy());
+        this.byFlag = Collections.unmodifiableMap(map);
     }
 
     /**
@@ -36,33 +40,35 @@ public class StrategyRegistery {
      *
      * @throws InvalidInputException if the flag is null or not a known algorithm
      */
-
     public EncodingStrategy resolve(String flag) {
         if (flag == null) {
             throw new InvalidInputException("No algorithm specified. Supported: " + supported());
         }
-
         EncodingStrategy strategy = byFlag.get(flag.toLowerCase(Locale.ROOT));
-
         if (strategy == null) {
-            throw new InvalidInputException("Unknown algorithm '" + flag + ". Supported: " + supported());
+            throw new InvalidInputException(
+                    "Unknown algorithm '" + flag + "'. Supported: " + supported());
         }
-
         return strategy;
     }
 
+    /**
+     * Resolves the algorithm id stored in a decoded payload header (decode path).
+     *
+     * @throws BadPasswordException if no registered strategy has that id
+     *                              (corrupt/foreign payload)
+     */
     public EncodingStrategy byId(int id) {
         for (EncodingStrategy strategy : byFlag.values()) {
             if (strategy.id() == id) {
                 return strategy;
             }
         }
-
-        throw new BadPasswordException("Corrput payload: unknown algorithm id " + id + ".");
+        throw new BadPasswordException("Corrupt payload: unknown algorithm id " + id + ".");
     }
 
+    /** Comma-separated list of supported flags, for help and error messages. */
     public String supported() {
         return String.join(", ", byFlag.keySet());
     }
-
 }
